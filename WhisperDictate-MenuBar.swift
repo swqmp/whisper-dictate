@@ -11,6 +11,14 @@ let tmpDir = "/tmp"
 
 let availableModels = ["tiny.en", "base.en", "small.en", "medium.en", "turbo"]
 let defaultModel = "base.en"
+let whisperCacheDir = NSHomeDirectory() + "/.cache/whisper"
+let modelExpectedSizes: [String: String] = [
+    "tiny.en": "~75 MB",
+    "base.en": "~140 MB",
+    "small.en": "~465 MB",
+    "medium.en": "~1.5 GB",
+    "turbo": "~1.6 GB"
+]
 
 enum PasteMode: Int {
     case autoPaste = 0
@@ -229,6 +237,11 @@ class PreferencesWindowController: NSObject, NSWindowDelegate {
     private var localViews: [NSView] = []
     private var cloudViews: [NSView] = []
     private var apiKeyField: NSSecureTextField?
+    private var modelPopupRef: NSPopUpButton?
+    private var modelStatusLabel: NSTextField?
+    private var downloadButton: NSButton?
+    private var downloadProgress: NSProgressIndicator?
+    private var downloadProcess: Process?
 
     func show() {
         if let existing = window, existing.isVisible {
@@ -238,7 +251,7 @@ class PreferencesWindowController: NSObject, NSWindowDelegate {
         }
 
         let w = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 380, height: 520),
+            contentRect: NSRect(x: 0, y: 0, width: 380, height: 600),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
@@ -249,7 +262,7 @@ class PreferencesWindowController: NSObject, NSWindowDelegate {
         w.isReleasedWhenClosed = false
 
         let contentView = NSView(frame: w.contentView!.bounds)
-        var y = 480
+        var y = 560
 
         // Launch at login
         let loginCheck = NSButton(checkboxWithTitle: "Start at login", target: self, action: #selector(loginToggled(_:)))
@@ -353,7 +366,7 @@ class PreferencesWindowController: NSObject, NSWindowDelegate {
         contentView.addSubview(backendPopup)
         y -= 40
 
-        // Local-only views: model selector
+        // Local-only views: model selector + status
         localViews = []
         let modelLabel = NSTextField(labelWithString: "Whisper model:")
         modelLabel.frame = NSRect(x: 20, y: y, width: 140, height: 20)
@@ -362,7 +375,10 @@ class PreferencesWindowController: NSObject, NSWindowDelegate {
         localViews.append(modelLabel)
 
         let modelPopup = NSPopUpButton(frame: NSRect(x: 170, y: y - 5, width: 190, height: 30), pullsDown: false)
-        modelPopup.addItems(withTitles: availableModels)
+        for model in availableModels {
+            let installed = isModelDownloaded(model)
+            modelPopup.addItem(withTitle: installed ? "\(model) (Installed)" : "\(model) (Not Installed)")
+        }
         if let idx = availableModels.firstIndex(of: Settings.shared.whisperModel) {
             modelPopup.selectItem(at: idx)
         }
@@ -370,9 +386,42 @@ class PreferencesWindowController: NSObject, NSWindowDelegate {
         modelPopup.action = #selector(modelChanged(_:))
         contentView.addSubview(modelPopup)
         localViews.append(modelPopup)
+        self.modelPopupRef = modelPopup
 
-        let modelHint = NSTextField(labelWithString: "Smaller = faster, larger = more accurate.\nFirst use downloads the model automatically.")
-        modelHint.frame = NSRect(x: 20, y: y - 40, width: 340, height: 30)
+        // Model status label
+        let statusLabel = NSTextField(labelWithString: "")
+        statusLabel.frame = NSRect(x: 20, y: y - 38, width: 220, height: 16)
+        statusLabel.font = NSFont.systemFont(ofSize: 11)
+        statusLabel.isBezeled = false
+        statusLabel.isEditable = false
+        statusLabel.drawsBackground = false
+        contentView.addSubview(statusLabel)
+        localViews.append(statusLabel)
+        self.modelStatusLabel = statusLabel
+
+        // Download button
+        let dlButton = NSButton(title: "Download", target: self, action: #selector(downloadSelectedModel(_:)))
+        dlButton.frame = NSRect(x: 250, y: y - 42, width: 110, height: 24)
+        dlButton.bezelStyle = .rounded
+        dlButton.font = NSFont.systemFont(ofSize: 11)
+        dlButton.isHidden = true
+        contentView.addSubview(dlButton)
+        localViews.append(dlButton)
+        self.downloadButton = dlButton
+
+        // Download progress bar (not in localViews — only shown during active download)
+        let progressBar = NSProgressIndicator(frame: NSRect(x: 20, y: y - 60, width: 340, height: 6))
+        progressBar.style = .bar
+        progressBar.minValue = 0
+        progressBar.maxValue = 100
+        progressBar.isIndeterminate = false
+        progressBar.isHidden = true
+        contentView.addSubview(progressBar)
+        self.downloadProgress = progressBar
+
+        // Model hint
+        let modelHint = NSTextField(labelWithString: "Smaller = faster, larger = more accurate.")
+        modelHint.frame = NSRect(x: 20, y: y - 80, width: 340, height: 16)
         modelHint.font = NSFont.systemFont(ofSize: 11)
         modelHint.textColor = .secondaryLabelColor
         contentView.addSubview(modelHint)
@@ -410,6 +459,9 @@ class PreferencesWindowController: NSObject, NSWindowDelegate {
         localViews.forEach { $0.isHidden = isCloud }
         cloudViews.forEach { $0.isHidden = !isCloud }
 
+        // Set model status after show/hide so it doesn't get overridden
+        updateModelStatus()
+
         w.contentView = contentView
         w.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
@@ -445,8 +497,24 @@ class PreferencesWindowController: NSObject, NSWindowDelegate {
     }
 
     @objc func modelChanged(_ sender: NSPopUpButton) {
-        if let title = sender.selectedItem?.title {
-            Settings.shared.whisperModel = title
+        let idx = sender.indexOfSelectedItem
+        guard idx >= 0 && idx < availableModels.count else { return }
+        let model = availableModels[idx]
+        Settings.shared.whisperModel = model
+        updateModelStatus()
+
+        if !isModelDownloaded(model) {
+            let size = modelExpectedSizes[model] ?? "unknown"
+            let alert = NSAlert()
+            alert.messageText = "Model Not Installed"
+            alert.informativeText = "\"\(model)\" is not downloaded yet (\(size)). Would you like to download it now?"
+            alert.alertStyle = .informational
+            alert.addButton(withTitle: "Download")
+            alert.addButton(withTitle: "Not Now")
+            let response = alert.runModal()
+            if response == .alertFirstButtonReturn {
+                downloadSelectedModel(downloadButton ?? NSButton())
+            }
         }
     }
 
@@ -461,6 +529,113 @@ class PreferencesWindowController: NSObject, NSWindowDelegate {
     @objc func apiKeyChanged(_ sender: NSSecureTextField) {
         let key = sender.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         Settings.shared.openAIApiKey = key.isEmpty ? nil : key
+    }
+
+    func isModelDownloaded(_ model: String) -> Bool {
+        let path = whisperCacheDir + "/\(model).pt"
+        return FileManager.default.fileExists(atPath: path)
+    }
+
+    func modelFileSizeString(_ model: String) -> String {
+        let path = whisperCacheDir + "/\(model).pt"
+        if let attrs = try? FileManager.default.attributesOfItem(atPath: path),
+           let size = attrs[.size] as? UInt64 {
+            if size >= 1_000_000_000 {
+                return String(format: "%.1f GB", Double(size) / 1_000_000_000)
+            } else {
+                return String(format: "%d MB", size / 1_000_000)
+            }
+        }
+        return modelExpectedSizes[model] ?? "unknown"
+    }
+
+    func updateModelStatus() {
+        let model = Settings.shared.whisperModel
+        let installed = isModelDownloaded(model)
+        if installed {
+            let size = modelFileSizeString(model)
+            modelStatusLabel?.stringValue = "✓ Installed (\(size))"
+            modelStatusLabel?.textColor = NSColor.systemGreen
+            downloadButton?.isHidden = true
+        } else {
+            let size = modelExpectedSizes[model] ?? "unknown"
+            modelStatusLabel?.stringValue = "Not downloaded (\(size))"
+            modelStatusLabel?.textColor = NSColor.secondaryLabelColor
+            downloadButton?.isHidden = false
+        }
+    }
+
+    func refreshModelPopup() {
+        guard let popup = modelPopupRef else { return }
+        let selectedIdx = popup.indexOfSelectedItem
+        popup.removeAllItems()
+        for model in availableModels {
+            let installed = isModelDownloaded(model)
+            popup.addItem(withTitle: installed ? "\(model) (Installed)" : "\(model) (Not Installed)")
+        }
+        popup.selectItem(at: selectedIdx)
+    }
+
+    @objc func downloadSelectedModel(_ sender: NSButton) {
+        let model = Settings.shared.whisperModel
+        guard !isModelDownloaded(model) else { return }
+
+        downloadButton?.isHidden = true
+        downloadProgress?.isHidden = false
+        downloadProgress?.doubleValue = 0
+        modelStatusLabel?.stringValue = "Downloading \(model)..."
+        modelStatusLabel?.textColor = NSColor.systemOrange
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/opt/homebrew/bin/python3")
+            process.arguments = ["-u", "-c", "import whisper; whisper.load_model('\(model)')"]
+            process.environment = [
+                "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+                "HOME": NSHomeDirectory()
+            ]
+            self?.downloadProcess = process
+
+            let stderrPipe = Pipe()
+            process.standardError = stderrPipe
+            process.standardOutput = Pipe()
+
+            stderrPipe.fileHandleForReading.readabilityHandler = { handle in
+                let data = handle.availableData
+                guard !data.isEmpty, let line = String(data: data, encoding: .utf8) else { return }
+                if let range = line.range(of: #"(\d+)%\|"#, options: .regularExpression) {
+                    let match = line[range]
+                    let digits = match.filter { $0.isNumber }
+                    if let pct = Int(digits) {
+                        DispatchQueue.main.async {
+                            self?.downloadProgress?.doubleValue = Double(pct)
+                            self?.modelStatusLabel?.stringValue = "Downloading \(model)... \(pct)%"
+                        }
+                    }
+                }
+            }
+
+            do {
+                try process.run()
+                process.waitUntilExit()
+                stderrPipe.fileHandleForReading.readabilityHandler = nil
+
+                DispatchQueue.main.async {
+                    self?.downloadProcess = nil
+                    self?.downloadProgress?.isHidden = true
+                    self?.refreshModelPopup()
+                    self?.updateModelStatus()
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self?.downloadProcess = nil
+                    self?.downloadProgress?.isHidden = true
+                    self?.modelStatusLabel?.stringValue = "Download failed"
+                    self?.modelStatusLabel?.textColor = NSColor.systemRed
+                    self?.downloadButton?.isHidden = false
+                }
+            }
+        }
     }
 }
 
@@ -665,6 +840,702 @@ class HistoryWindowController: NSObject, NSWindowDelegate {
     @objc func clearHistory() {
         TranscriptionHistory.shared.clear()
         refresh()
+    }
+}
+
+// MARK: - Permission & Setup Flow (Guided)
+class PermissionSetupController: NSObject, NSWindowDelegate {
+    var window: NSWindow?
+    var onComplete: (() -> Void)?
+    private var titleLabel: NSTextField?
+    private var descLabel: NSTextField?
+    private var actionButton: NSButton?
+    private var statusLabel: NSTextField?
+    private var stepIndicator: NSTextField?
+    private var pollTimer: Timer?
+    private var currentStep = 0
+    private var dynamicViews: [NSView] = []
+    private var chosenBackend: TranscriptionBackend = .local
+    private var chosenModel: String = defaultModel
+    private var setupApiKeyField: NSSecureTextField?
+    private var setupProgressBar: NSProgressIndicator?
+    private var downloadProcess: Process?
+
+    private var totalSteps: Int { Settings.shared.hasCompletedSetup ? 3 : 6 }
+
+    // Returns true if all permissions are already granted
+    func allPermissionsGranted() -> Bool {
+        let micGranted = AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
+        let axGranted = AXIsProcessTrusted()
+        return micGranted && axGranted
+    }
+
+    func show() {
+        // If permissions are granted AND setup is done, skip entirely
+        if allPermissionsGranted() && Settings.shared.hasCompletedSetup {
+            onComplete?()
+            return
+        }
+
+        let w = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 440, height: 260),
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+        w.title = "WhisperDictate — Setup"
+        w.center()
+        w.delegate = self
+        w.isReleasedWhenClosed = false
+        w.level = .floating
+
+        let cv = NSView(frame: w.contentView!.bounds)
+
+        // Step indicator
+        let stepInd = NSTextField(labelWithString: "")
+        stepInd.font = NSFont.systemFont(ofSize: 11)
+        stepInd.textColor = .secondaryLabelColor
+        stepInd.frame = NSRect(x: 20, y: 220, width: 400, height: 16)
+        cv.addSubview(stepInd)
+        self.stepIndicator = stepInd
+
+        // Title
+        let title = NSTextField(labelWithString: "")
+        title.font = NSFont.systemFont(ofSize: 18, weight: .semibold)
+        title.frame = NSRect(x: 20, y: 185, width: 400, height: 28)
+        cv.addSubview(title)
+        self.titleLabel = title
+
+        // Description
+        let desc = NSTextField(wrappingLabelWithString: "")
+        desc.font = NSFont.systemFont(ofSize: 13)
+        desc.textColor = .secondaryLabelColor
+        desc.frame = NSRect(x: 20, y: 105, width: 400, height: 70)
+        cv.addSubview(desc)
+        self.descLabel = desc
+
+        // Status label
+        let status = NSTextField(labelWithString: "")
+        status.font = NSFont.systemFont(ofSize: 12, weight: .medium)
+        status.frame = NSRect(x: 20, y: 65, width: 400, height: 20)
+        cv.addSubview(status)
+        self.statusLabel = status
+
+        // Action button
+        let btn = NSButton(title: "Grant Permission", target: self, action: #selector(actionPressed))
+        btn.bezelStyle = .rounded
+        btn.frame = NSRect(x: 110, y: 20, width: 220, height: 32)
+        btn.font = NSFont.systemFont(ofSize: 13, weight: .medium)
+        btn.keyEquivalent = "\r"
+        cv.addSubview(btn)
+        self.actionButton = btn
+
+        w.contentView = cv
+        w.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        self.window = w
+
+        // Figure out which step to start on
+        currentStep = 0
+        if AVCaptureDevice.authorizationStatus(for: .audio) == .authorized {
+            currentStep = 1
+        }
+        if AXIsProcessTrusted() && currentStep == 1 {
+            currentStep = 2
+        }
+        showCurrentStep()
+    }
+
+    private func clearDynamicViews() {
+        dynamicViews.forEach { $0.removeFromSuperview() }
+        dynamicViews.removeAll()
+        setupApiKeyField = nil
+        setupProgressBar = nil
+    }
+
+    private func resizeWindow(height: CGFloat) {
+        guard let w = window else { return }
+        var frame = w.frame
+        let diff = height - frame.size.height
+        frame.size.height = height
+        frame.origin.y -= diff
+        w.setFrame(frame, display: true, animate: true)
+
+        // Resize content view to match and reposition fixed elements
+        w.contentView?.frame = NSRect(x: 0, y: 0, width: frame.size.width, height: height)
+        let top = height - 55
+        stepIndicator?.frame.origin.y = top
+        titleLabel?.frame.origin.y = top - 30
+    }
+
+    private func showCurrentStep() {
+        pollTimer?.invalidate()
+        pollTimer = nil
+        clearDynamicViews()
+        actionButton?.isEnabled = true
+        actionButton?.isHidden = false
+        statusLabel?.stringValue = ""
+
+        switch currentStep {
+        case 0: showMicrophoneStep()
+        case 1: showAccessibilityStep()
+        case 2: showKeychainStep()
+        case 3: showHotkeyStep()
+        case 4: showBackendChoice()
+        case 5: showBackendSetup()
+        default: finishSetup()
+        }
+    }
+
+    // Helper to position desc label relative to the title
+    private func positionDesc(height: CGFloat, descHeight: CGFloat = 70) {
+        let titleY = titleLabel?.frame.origin.y ?? 0
+        descLabel?.frame = NSRect(x: 20, y: titleY - 30 - descHeight, width: 400, height: descHeight)
+    }
+
+    // MARK: Step 0 — Microphone
+    private func showMicrophoneStep() {
+        resizeWindow(height: 260)
+        stepIndicator?.stringValue = "Step 1 of \(totalSteps)"
+        titleLabel?.stringValue = "Microphone Access"
+        positionDesc(height: 260, descHeight: 70)
+        descLabel?.stringValue = "WhisperDictate needs microphone access to record your voice for transcription. Click the button below to grant permission."
+        actionButton?.title = "Grant Microphone"
+
+        if AVCaptureDevice.authorizationStatus(for: .audio) == .authorized {
+            currentStep = 1
+            showCurrentStep()
+        }
+    }
+
+    // MARK: Step 1 — Accessibility
+    private func showAccessibilityStep() {
+        resizeWindow(height: 260)
+        stepIndicator?.stringValue = "Step 2 of \(totalSteps)"
+        titleLabel?.stringValue = "Accessibility Access"
+        positionDesc(height: 260, descHeight: 70)
+        descLabel?.stringValue = "WhisperDictate needs Accessibility access so it can listen for your hotkey. System Settings will open — find WhisperDictate in the list and toggle it on, then come back here."
+        actionButton?.title = "Open Accessibility Settings"
+
+        if AXIsProcessTrusted() {
+            currentStep = 2
+            showCurrentStep()
+        }
+    }
+
+    // MARK: Step 2 — Keychain
+    private func showKeychainStep() {
+        resizeWindow(height: 290)
+        stepIndicator?.stringValue = "Step 3 of \(totalSteps)"
+        titleLabel?.stringValue = "Keychain Access"
+        positionDesc(height: 290, descHeight: 90)
+        descLabel?.stringValue = "WhisperDictate stores sensitive data (like API keys) in your Mac's Keychain. You may see a password prompt — enter your Mac password and click \"Always Allow\". This is highly recommended, otherwise you'll have to enter your password every single time."
+        actionButton?.title = "Authorize Keychain"
+    }
+
+    // MARK: Step 3 — Hotkey & Recording Mode
+    private func showHotkeyStep() {
+        resizeWindow(height: 340)
+        stepIndicator?.stringValue = "Step 4 of \(totalSteps)"
+        titleLabel?.stringValue = "Hotkey & Recording Mode"
+        positionDesc(height: 340, descHeight: 30)
+        descLabel?.stringValue = "Choose how you want to trigger recording. You can change this in Settings."
+        actionButton?.title = "Continue"
+        statusLabel?.stringValue = ""
+
+        guard let cv = window?.contentView else { return }
+        let titleY = titleLabel?.frame.origin.y ?? 0
+        var y = Int(titleY) - 80
+
+        // Hotkey choice
+        let hotkeyLabel = NSTextField(labelWithString: "Hotkey:")
+        hotkeyLabel.font = NSFont.systemFont(ofSize: 13, weight: .medium)
+        hotkeyLabel.frame = NSRect(x: 20, y: y, width: 100, height: 20)
+        cv.addSubview(hotkeyLabel)
+        dynamicViews.append(hotkeyLabel)
+
+        let rightOptRadio = NSButton(radioButtonWithTitle: "  Right Option key", target: self, action: #selector(hotkeyRadioChanged(_:)))
+        rightOptRadio.frame = NSRect(x: 130, y: y, width: 160, height: 20)
+        rightOptRadio.tag = 0
+        rightOptRadio.state = .on
+        cv.addSubview(rightOptRadio)
+        dynamicViews.append(rightOptRadio)
+
+        let fnRadio = NSButton(radioButtonWithTitle: "  fn key", target: self, action: #selector(hotkeyRadioChanged(_:)))
+        fnRadio.frame = NSRect(x: 300, y: y, width: 120, height: 20)
+        fnRadio.tag = 1
+        fnRadio.state = .off
+        cv.addSubview(fnRadio)
+        dynamicViews.append(fnRadio)
+
+        y -= 40
+
+        // Recording mode
+        let modeLabel = NSTextField(labelWithString: "Recording mode:")
+        modeLabel.font = NSFont.systemFont(ofSize: 13, weight: .medium)
+        modeLabel.frame = NSRect(x: 20, y: y, width: 120, height: 20)
+        cv.addSubview(modeLabel)
+        dynamicViews.append(modeLabel)
+
+        let holdRadio = NSButton(radioButtonWithTitle: "  Hold to record", target: self, action: #selector(modeRadioChanged(_:)))
+        holdRadio.frame = NSRect(x: 150, y: y, width: 140, height: 20)
+        holdRadio.tag = 0
+        holdRadio.state = .on
+        cv.addSubview(holdRadio)
+        dynamicViews.append(holdRadio)
+
+        let toggleRadio = NSButton(radioButtonWithTitle: "  Click to toggle", target: self, action: #selector(modeRadioChanged(_:)))
+        toggleRadio.frame = NSRect(x: 300, y: y, width: 130, height: 20)
+        toggleRadio.tag = 1
+        toggleRadio.state = .off
+        cv.addSubview(toggleRadio)
+        dynamicViews.append(toggleRadio)
+
+        y -= 30
+
+        let holdDesc = NSTextField(labelWithString: "Hold: press and hold the key while speaking, release to transcribe.\nToggle: press once to start, press again to stop and transcribe.")
+        holdDesc.font = NSFont.systemFont(ofSize: 11)
+        holdDesc.textColor = .secondaryLabelColor
+        holdDesc.frame = NSRect(x: 20, y: y - 20, width: 400, height: 30)
+        cv.addSubview(holdDesc)
+        dynamicViews.append(holdDesc)
+    }
+
+    @objc func hotkeyRadioChanged(_ sender: NSButton) {
+        Settings.shared.hotkeyChoice = HotkeyChoice(rawValue: sender.tag) ?? .rightOption
+    }
+
+    @objc func modeRadioChanged(_ sender: NSButton) {
+        Settings.shared.recordingMode = RecordingMode(rawValue: sender.tag) ?? .holdToRecord
+    }
+
+    private func saveHotkeyChoice() {
+        // Settings already saved via radio handlers, just advance
+        currentStep = 4
+        showCurrentStep()
+    }
+
+    // MARK: Step 4 — Backend Choice
+    private func showBackendChoice() {
+        resizeWindow(height: 360)
+        stepIndicator?.stringValue = "Step 5 of 6"
+        titleLabel?.stringValue = "Choose Your Transcription Method"
+        positionDesc(height: 360, descHeight: 30)
+        descLabel?.stringValue = "You can change this anytime in Settings."
+        actionButton?.title = "Continue"
+        statusLabel?.stringValue = ""
+
+        guard let cv = window?.contentView else { return }
+
+        // Local option
+        let localRadio = NSButton(radioButtonWithTitle: "  Local (On-Device)", target: self, action: #selector(backendRadioChanged(_:)))
+        localRadio.frame = NSRect(x: 20, y: 210, width: 400, height: 20)
+        localRadio.font = NSFont.systemFont(ofSize: 14, weight: .medium)
+        localRadio.tag = 0
+        localRadio.state = .on
+        cv.addSubview(localRadio)
+        dynamicViews.append(localRadio)
+
+        let localDesc = NSTextField(labelWithString: "Completely private. Free, runs entirely on your Mac. No internet needed.")
+        localDesc.font = NSFont.systemFont(ofSize: 11)
+        localDesc.textColor = .secondaryLabelColor
+        localDesc.frame = NSRect(x: 42, y: 190, width: 380, height: 16)
+        cv.addSubview(localDesc)
+        dynamicViews.append(localDesc)
+
+        // Cloud option
+        let cloudRadio = NSButton(radioButtonWithTitle: "  Cloud (OpenAI API)", target: self, action: #selector(backendRadioChanged(_:)))
+        cloudRadio.frame = NSRect(x: 20, y: 150, width: 400, height: 20)
+        cloudRadio.font = NSFont.systemFont(ofSize: 14, weight: .medium)
+        cloudRadio.tag = 1
+        cloudRadio.state = .off
+        cv.addSubview(cloudRadio)
+        dynamicViews.append(cloudRadio)
+
+        let cloudDesc = NSTextField(labelWithString: "Uses OpenAI's whisper-1 model. Fast, no RAM usage. ~$0.006/min.")
+        cloudDesc.font = NSFont.systemFont(ofSize: 11)
+        cloudDesc.textColor = .secondaryLabelColor
+        cloudDesc.frame = NSRect(x: 42, y: 130, width: 380, height: 16)
+        cv.addSubview(cloudDesc)
+        dynamicViews.append(cloudDesc)
+
+        chosenBackend = .local
+    }
+
+    @objc func backendRadioChanged(_ sender: NSButton) {
+        chosenBackend = sender.tag == 1 ? .cloud : .local
+    }
+
+    // MARK: Step 4 — Backend-Specific Setup
+    private func showBackendSetup() {
+        if chosenBackend == .cloud {
+            showCloudSetup()
+        } else {
+            showLocalModelSetup()
+        }
+    }
+
+    private func showCloudSetup() {
+        resizeWindow(height: 380)
+        stepIndicator?.stringValue = "Step 6 of 6 — API Setup"
+        titleLabel?.stringValue = "Set Up OpenAI API"
+        positionDesc(height: 380, descHeight: 40)
+        descLabel?.stringValue = "You need an OpenAI API key to use cloud transcription. It takes about 30 seconds to set up."
+        actionButton?.title = "Finish Setup"
+        statusLabel?.stringValue = ""
+
+        guard let cv = window?.contentView else { return }
+
+        // Steps
+        let steps = NSTextField(wrappingLabelWithString: "1. Go to platform.openai.com/api-keys\n2. Sign in or create an account\n3. Click \"Create new secret key\"\n4. Copy the key and paste it below")
+        steps.font = NSFont.systemFont(ofSize: 12)
+        steps.frame = NSRect(x: 20, y: 145, width: 400, height: 80)
+        cv.addSubview(steps)
+        dynamicViews.append(steps)
+
+        // API key field
+        let keyLabel = NSTextField(labelWithString: "API Key:")
+        keyLabel.font = NSFont.systemFont(ofSize: 13, weight: .medium)
+        keyLabel.frame = NSRect(x: 20, y: 115, width: 70, height: 20)
+        cv.addSubview(keyLabel)
+        dynamicViews.append(keyLabel)
+
+        let keyField = NSSecureTextField(frame: NSRect(x: 95, y: 112, width: 325, height: 26))
+        keyField.placeholderString = "sk-..."
+        keyField.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+        cv.addSubview(keyField)
+        dynamicViews.append(keyField)
+        self.setupApiKeyField = keyField
+
+        let hint = NSTextField(labelWithString: "Key is stored securely in your Mac's Keychain, not in plain text.")
+        hint.font = NSFont.systemFont(ofSize: 10)
+        hint.textColor = .tertiaryLabelColor
+        hint.frame = NSRect(x: 95, y: 92, width: 325, height: 14)
+        cv.addSubview(hint)
+        dynamicViews.append(hint)
+    }
+
+    private func showLocalModelSetup() {
+        resizeWindow(height: 480)
+        stepIndicator?.stringValue = "Step 6 of 6 — Model Selection"
+        titleLabel?.stringValue = "Choose a Whisper Model"
+        positionDesc(height: 480, descHeight: 30)
+
+        let ramBytes = ProcessInfo.processInfo.physicalMemory
+        let ramGB = Int(ramBytes / (1024 * 1024 * 1024))
+        descLabel?.stringValue = "Your Mac has \(ramGB) GB of RAM. Pick a model based on your needs:"
+        actionButton?.title = "Download & Finish"
+        statusLabel?.stringValue = ""
+
+        guard let cv = window?.contentView else { return }
+
+        // Determine recommended model
+        let recommended: String
+        if ramGB >= 32 {
+            recommended = "turbo"
+        } else if ramGB >= 16 {
+            recommended = "small.en"
+        } else {
+            recommended = "base.en"
+        }
+        chosenModel = recommended
+
+        struct ModelInfo {
+            let name: String
+            let size: String
+            let speed: String
+            let accuracy: String
+        }
+
+        let models: [ModelInfo] = [
+            ModelInfo(name: "tiny.en", size: "75 MB", speed: "Fastest", accuracy: "Basic"),
+            ModelInfo(name: "base.en", size: "140 MB", speed: "Fast", accuracy: "Good"),
+            ModelInfo(name: "small.en", size: "465 MB", speed: "Moderate", accuracy: "Great"),
+            ModelInfo(name: "medium.en", size: "1.5 GB", speed: "Slower", accuracy: "Excellent"),
+            ModelInfo(name: "turbo", size: "1.5 GB", speed: "Fast", accuracy: "Excellent"),
+        ]
+
+        var y = 350
+        for (i, model) in models.enumerated() {
+            let isRec = model.name == recommended
+            let installed = FileManager.default.fileExists(atPath: whisperCacheDir + "/\(model.name).pt")
+
+            let radio = NSButton(radioButtonWithTitle: "", target: self, action: #selector(modelRadioChanged(_:)))
+            radio.frame = NSRect(x: 20, y: y, width: 20, height: 20)
+            radio.tag = i
+            radio.state = isRec ? .on : .off
+            cv.addSubview(radio)
+            dynamicViews.append(radio)
+
+            let nameLabel = NSTextField(labelWithString: model.name)
+            nameLabel.font = NSFont.monospacedSystemFont(ofSize: 13, weight: isRec ? .bold : .regular)
+            nameLabel.frame = NSRect(x: 42, y: y, width: 80, height: 18)
+            cv.addSubview(nameLabel)
+            dynamicViews.append(nameLabel)
+
+            let detailText = "\(model.size)  •  \(model.speed)  •  \(model.accuracy)"
+            let detailLabel = NSTextField(labelWithString: detailText)
+            detailLabel.font = NSFont.systemFont(ofSize: 11)
+            detailLabel.textColor = .secondaryLabelColor
+            detailLabel.frame = NSRect(x: 130, y: y, width: 200, height: 18)
+            cv.addSubview(detailLabel)
+            dynamicViews.append(detailLabel)
+
+            // Badge: Recommended or Installed
+            if isRec {
+                let badge = NSTextField(labelWithString: "Recommended")
+                badge.font = NSFont.systemFont(ofSize: 10, weight: .semibold)
+                badge.textColor = .systemBlue
+                badge.frame = NSRect(x: 340, y: y, width: 90, height: 18)
+                cv.addSubview(badge)
+                dynamicViews.append(badge)
+            } else if installed {
+                let badge = NSTextField(labelWithString: "Installed")
+                badge.font = NSFont.systemFont(ofSize: 10, weight: .medium)
+                badge.textColor = .systemGreen
+                badge.frame = NSRect(x: 340, y: y, width: 90, height: 18)
+                cv.addSubview(badge)
+                dynamicViews.append(badge)
+            }
+
+            y -= 30
+        }
+
+        // RAM recommendation note
+        let recNote: String
+        if ramGB >= 32 {
+            recNote = "With \(ramGB) GB RAM, you can comfortably run any model. Turbo gives the best accuracy with good speed."
+        } else if ramGB >= 16 {
+            recNote = "With \(ramGB) GB RAM, small.en is the best balance of speed and accuracy. Medium and turbo will work but use more memory."
+        } else {
+            recNote = "With \(ramGB) GB RAM, base.en is recommended. Larger models may slow down your Mac."
+        }
+        let note = NSTextField(wrappingLabelWithString: recNote)
+        note.font = NSFont.systemFont(ofSize: 11)
+        note.textColor = .secondaryLabelColor
+        note.frame = NSRect(x: 20, y: y - 15, width: 400, height: 35)
+        cv.addSubview(note)
+        dynamicViews.append(note)
+
+        // Progress bar (hidden until download starts)
+        let progress = NSProgressIndicator(frame: NSRect(x: 20, y: 70, width: 400, height: 6))
+        progress.style = .bar
+        progress.minValue = 0
+        progress.maxValue = 100
+        progress.isIndeterminate = false
+        progress.isHidden = true
+        cv.addSubview(progress)
+        dynamicViews.append(progress)
+        self.setupProgressBar = progress
+    }
+
+    @objc func modelRadioChanged(_ sender: NSButton) {
+        let idx = sender.tag
+        if idx >= 0 && idx < availableModels.count {
+            chosenModel = availableModels[idx]
+        }
+    }
+
+    @objc func actionPressed() {
+        switch currentStep {
+        case 0: requestMicrophone()
+        case 1: requestAccessibility()
+        case 2: requestKeychain()
+        case 3: // Hotkey step — save and advance
+            saveHotkeyChoice()
+        case 4: // Backend choice — advance to setup
+            Settings.shared.transcriptionBackend = chosenBackend
+            currentStep = 5
+            showCurrentStep()
+        case 5: // Final setup
+            if chosenBackend == .cloud {
+                finishCloudSetup()
+            } else {
+                finishLocalSetup()
+            }
+        default: finishSetup()
+        }
+    }
+
+    private func requestMicrophone() {
+        actionButton?.isEnabled = false
+        statusLabel?.stringValue = "Requesting permission..."
+        statusLabel?.textColor = .systemOrange
+        AVCaptureDevice.requestAccess(for: .audio) { [weak self] granted in
+            DispatchQueue.main.async {
+                self?.actionButton?.isEnabled = true
+                if granted {
+                    self?.statusLabel?.stringValue = "Microphone access granted"
+                    self?.statusLabel?.textColor = .systemGreen
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+                        self?.currentStep = 1
+                        self?.showCurrentStep()
+                    }
+                } else {
+                    self?.statusLabel?.stringValue = "Permission denied. Open System Settings > Privacy > Microphone to enable."
+                    self?.statusLabel?.textColor = .systemRed
+                    self?.actionButton?.title = "Try Again"
+                }
+            }
+        }
+    }
+
+    private func requestAccessibility() {
+        actionButton?.isEnabled = false
+        statusLabel?.stringValue = "Waiting for you to enable Accessibility..."
+        statusLabel?.textColor = .systemOrange
+        window?.level = .normal
+
+        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue(): true] as CFDictionary
+        _ = AXIsProcessTrustedWithOptions(options)
+
+        pollTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            if AXIsProcessTrusted() {
+                self?.pollTimer?.invalidate()
+                self?.pollTimer = nil
+                self?.window?.level = .floating
+                self?.window?.makeKeyAndOrderFront(nil)
+                NSApp.activate(ignoringOtherApps: true)
+                self?.actionButton?.isEnabled = true
+                self?.statusLabel?.stringValue = "Accessibility access granted"
+                self?.statusLabel?.textColor = .systemGreen
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+                    self?.currentStep = 2
+                    self?.showCurrentStep()
+                }
+            }
+        }
+    }
+
+    private func requestKeychain() {
+        actionButton?.isEnabled = false
+        statusLabel?.stringValue = "Authorizing Keychain..."
+        statusLabel?.textColor = .systemOrange
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            let _ = KeychainHelper.read(key: "openai-api-key")
+            let testKey = "permission-setup-test"
+            KeychainHelper.save(key: testKey, value: "ok")
+            let _ = KeychainHelper.read(key: testKey)
+            KeychainHelper.delete(key: testKey)
+
+            DispatchQueue.main.async { [weak self] in
+                self?.actionButton?.isEnabled = true
+                self?.statusLabel?.stringValue = "Keychain authorized"
+                self?.statusLabel?.textColor = .systemGreen
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+                    if Settings.shared.hasCompletedSetup {
+                        self?.finishSetup()
+                    } else {
+                        self?.currentStep = 3
+                        self?.showCurrentStep()
+                    }
+                }
+            }
+        }
+    }
+
+    private func finishCloudSetup() {
+        let key = setupApiKeyField?.stringValue.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if key.isEmpty {
+            statusLabel?.stringValue = "Please enter your API key."
+            statusLabel?.textColor = .systemRed
+            return
+        }
+        Settings.shared.transcriptionBackend = .cloud
+        Settings.shared.openAIApiKey = key
+        Settings.shared.hasCompletedSetup = true
+        finishSetup()
+    }
+
+    private func finishLocalSetup() {
+        Settings.shared.transcriptionBackend = .local
+        Settings.shared.whisperModel = chosenModel
+
+        let modelPath = whisperCacheDir + "/\(chosenModel).pt"
+        if FileManager.default.fileExists(atPath: modelPath) {
+            // Already downloaded
+            Settings.shared.hasCompletedSetup = true
+            finishSetup()
+            return
+        }
+
+        // Download the model
+        actionButton?.isEnabled = false
+        actionButton?.title = "Downloading..."
+        setupProgressBar?.isHidden = false
+        setupProgressBar?.doubleValue = 0
+        statusLabel?.stringValue = "Downloading \(chosenModel)..."
+        statusLabel?.textColor = .systemOrange
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/opt/homebrew/bin/python3")
+            process.arguments = ["-u", "-c", "import whisper; whisper.load_model('\(self.chosenModel)')"]
+            process.environment = [
+                "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+                "HOME": NSHomeDirectory()
+            ]
+            self.downloadProcess = process
+
+            let stderrPipe = Pipe()
+            process.standardError = stderrPipe
+            process.standardOutput = Pipe()
+
+            stderrPipe.fileHandleForReading.readabilityHandler = { handle in
+                let data = handle.availableData
+                guard !data.isEmpty, let line = String(data: data, encoding: .utf8) else { return }
+                if let range = line.range(of: #"(\d+)%\|"#, options: .regularExpression) {
+                    let match = line[range]
+                    let digits = match.filter { $0.isNumber }
+                    if let pct = Int(digits) {
+                        DispatchQueue.main.async {
+                            self.setupProgressBar?.doubleValue = Double(pct)
+                            self.statusLabel?.stringValue = "Downloading \(self.chosenModel)... \(pct)%"
+                        }
+                    }
+                }
+            }
+
+            do {
+                try process.run()
+                process.waitUntilExit()
+                stderrPipe.fileHandleForReading.readabilityHandler = nil
+
+                DispatchQueue.main.async {
+                    self.downloadProcess = nil
+                    Settings.shared.hasCompletedSetup = true
+                    self.statusLabel?.stringValue = "Download complete!"
+                    self.statusLabel?.textColor = .systemGreen
+                    self.setupProgressBar?.isHidden = true
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+                        self.finishSetup()
+                    }
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self.downloadProcess = nil
+                    self.statusLabel?.stringValue = "Download failed. You can download later from Settings."
+                    self.statusLabel?.textColor = .systemRed
+                    self.actionButton?.isEnabled = true
+                    self.actionButton?.title = "Skip & Finish"
+                    Settings.shared.hasCompletedSetup = true
+                }
+            }
+        }
+    }
+
+    private func finishSetup() {
+        pollTimer?.invalidate()
+        pollTimer = nil
+        window?.close()
+        onComplete?()
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        pollTimer?.invalidate()
+        pollTimer = nil
     }
 }
 
@@ -1127,6 +1998,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     let prefsController = PreferencesWindowController()
     let historyController = HistoryWindowController()
     let setupController = SetupWindowController()
+    let permissionController = PermissionSetupController()
     let overlay = StatusOverlay()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -1147,15 +2019,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         mainMenu.addItem(editMenuItem)
         NSApplication.shared.mainMenu = mainMenu
 
-        // First-launch setup
-        if !Settings.shared.hasCompletedSetup {
-            setupController.onComplete = { [weak self] in
-                self?.setupMenuAndHotkey()
-            }
-            setupController.show()
-            return
+        // Permission setup (runs every launch, skips if already granted)
+        permissionController.onComplete = { [weak self] in
+            self?.afterPermissions()
         }
+        permissionController.show()
+    }
 
+    func afterPermissions() {
         setupMenuAndHotkey()
     }
 
@@ -1170,7 +2041,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Create menu
         let menu = NSMenu()
-        menu.addItem(NSMenuItem(title: "Whisper Dictate v3.0", action: nil, keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Whisper Dictate v3.5", action: nil, keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "Status: Idle", action: nil, keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: Settings.shared.hotkeyDescription, action: nil, keyEquivalent: ""))
@@ -1530,6 +2401,7 @@ class HotkeyMonitor {
     weak var statusItem: NSStatusItem?
     var transcriptionProcess: Process?
     var aborted = false
+    var pendingHide: DispatchWorkItem?
     let overlay: StatusOverlay
 
     init(statusItem: NSStatusItem, overlay: StatusOverlay) {
@@ -1538,31 +2410,7 @@ class HotkeyMonitor {
     }
 
     func start() {
-        // Request microphone permission
-        AVCaptureDevice.requestAccess(for: .audio) { granted in
-            if !granted {
-                DispatchQueue.main.async {
-                    self.updateStatus("Mic permission denied")
-                }
-            }
-        }
-
-        // Check and prompt for Accessibility permission
-        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue(): true] as CFDictionary
-        if !AXIsProcessTrustedWithOptions(options) {
-            updateStatus("Grant Accessibility access to use hotkey")
-            // Poll until granted
-            DispatchQueue.global().async {
-                while !AXIsProcessTrusted() {
-                    Thread.sleep(forTimeInterval: 1.0)
-                }
-                DispatchQueue.main.async {
-                    self.setupEventTap()
-                }
-            }
-            return
-        }
-
+        // Permissions are handled by PermissionSetupController before we get here
         setupEventTap()
     }
 
@@ -1691,6 +2539,9 @@ class HotkeyMonitor {
 
     // MARK: - Recording actions
     func startRecordingUI() {
+        // Cancel any pending hide from a previous transcription
+        pendingHide?.cancel()
+        pendingHide = nil
         isRecording = true
         aborted = false
         recorder.startRecording()
@@ -1752,10 +2603,14 @@ class HotkeyMonitor {
                     let isClipboard = Settings.shared.pasteMode == .clipboardOnly
                     self.overlay.updateState(.done, clipboardMode: isClipboard)
 
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-                        self.overlay.hide()
-                        self.refreshStatusText()
+                    // Use cancellable work item so a quick re-record doesn't get killed
+                    self.pendingHide?.cancel()
+                    let hideWork = DispatchWorkItem { [weak self] in
+                        self?.overlay.hide()
+                        self?.refreshStatusText()
                     }
+                    self.pendingHide = hideWork
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: hideWork)
                 } else {
                     self.updateStatus("Transcription failed")
                     self.updateIcon("mic.circle")
@@ -1809,11 +2664,14 @@ class HotkeyMonitor {
         overlay.updateState(.aborted)
         setAbortMenuEnabled(false)
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-            self.overlay.hide()
-            self.refreshStatusText()
-            self.aborted = false
+        pendingHide?.cancel()
+        let hideWork = DispatchWorkItem { [weak self] in
+            self?.overlay.hide()
+            self?.refreshStatusText()
+            self?.aborted = false
         }
+        pendingHide = hideWork
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: hideWork)
     }
 
     func setAbortMenuEnabled(_ enabled: Bool) {
