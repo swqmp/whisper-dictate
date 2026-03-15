@@ -672,8 +672,18 @@ class PreferencesWindowController: NSObject, NSWindowDelegate {
                         self?.refreshModelPopup()
                         self?.updateModelStatus()
                     } else {
-                        let errMsg = stderrOutput.suffix(200).trimmingCharacters(in: .whitespacesAndNewlines)
-                        self?.modelStatusLabel?.stringValue = "Download failed: \(errMsg.isEmpty ? "exit code \(exitCode)" : String(errMsg.prefix(80)))"
+                        // Extract last meaningful line from traceback
+                        let lines = stderrOutput.components(separatedBy: .newlines).filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+                        let lastLine = lines.last ?? "exit code \(exitCode)"
+                        let errSummary: String
+                        if lastLine.contains("No module named") {
+                            errSummary = "whisper not installed. Run: pip3 install openai-whisper"
+                        } else if lastLine.contains("ModuleNotFoundError") || lastLine.contains("ImportError") {
+                            errSummary = "Missing dependency. Run: pip3 install openai-whisper"
+                        } else {
+                            errSummary = String(lastLine.prefix(100))
+                        }
+                        self?.modelStatusLabel?.stringValue = "Failed: \(errSummary)"
                         self?.modelStatusLabel?.textColor = NSColor.systemRed
                         self?.downloadButton?.isHidden = false
                     }
@@ -682,7 +692,7 @@ class PreferencesWindowController: NSObject, NSWindowDelegate {
                 DispatchQueue.main.async {
                     self?.downloadProcess = nil
                     self?.downloadProgress?.isHidden = true
-                    self?.modelStatusLabel?.stringValue = "Python not found. Install: brew install python && pip3 install openai-whisper"
+                    self?.modelStatusLabel?.stringValue = "Python not found. Run: brew install python && pip3 install openai-whisper"
                     self?.modelStatusLabel?.textColor = NSColor.systemRed
                     self?.downloadButton?.isHidden = false
                 }
@@ -922,11 +932,27 @@ class PermissionSetupController: NSObject, NSWindowDelegate {
         return micGranted && axGranted
     }
 
+    // Check if user has at least one working backend ready
+    func hasWorkingBackend() -> Bool {
+        if Settings.shared.transcriptionBackend == .cloud {
+            return !(Settings.shared.openAIApiKey ?? "").isEmpty
+        }
+        // Local backend — check if selected model is downloaded
+        let model = Settings.shared.whisperModel
+        let modelPath = whisperCacheDir + "/\(model).pt"
+        return FileManager.default.fileExists(atPath: modelPath)
+    }
+
     func show() {
-        // If permissions are granted AND setup is done, skip entirely
-        if allPermissionsGranted() && Settings.shared.hasCompletedSetup {
+        // If permissions are granted AND setup is done AND backend works, skip entirely
+        if allPermissionsGranted() && Settings.shared.hasCompletedSetup && hasWorkingBackend() {
             onComplete?()
             return
+        }
+
+        // If setup was "completed" but no backend works, re-run the full setup
+        if Settings.shared.hasCompletedSetup && !hasWorkingBackend() {
+            Settings.shared.hasCompletedSetup = false
         }
 
         let w = NSWindow(
@@ -1570,24 +1596,31 @@ class PermissionSetupController: NSObject, NSWindowDelegate {
                             self.finishSetup()
                         }
                     } else {
-                        let errMsg = stderrOutput.suffix(200).trimmingCharacters(in: .whitespacesAndNewlines)
-                        self.statusLabel?.stringValue = "Download failed: \(errMsg.isEmpty ? "exit code \(exitCode)" : String(errMsg.prefix(80)))"
+                        let lines = stderrOutput.components(separatedBy: .newlines).filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+                        let lastLine = lines.last ?? "exit code \(exitCode)"
+                        let errSummary: String
+                        if lastLine.contains("No module named") {
+                            errSummary = "whisper not installed. Run: pip3 install openai-whisper"
+                        } else if lastLine.contains("ModuleNotFoundError") || lastLine.contains("ImportError") {
+                            errSummary = "Missing dependency. Run: pip3 install openai-whisper"
+                        } else {
+                            errSummary = String(lastLine.prefix(100))
+                        }
+                        self.statusLabel?.stringValue = "Failed: \(errSummary)"
                         self.statusLabel?.textColor = .systemRed
                         self.setupProgressBar?.isHidden = true
                         self.actionButton?.isEnabled = true
                         self.actionButton?.title = "Skip & Finish"
-                        Settings.shared.hasCompletedSetup = true
                     }
                 }
             } catch {
                 DispatchQueue.main.async {
                     self.downloadProcess = nil
-                    self.statusLabel?.stringValue = "Python not found. Install: brew install python && pip3 install openai-whisper"
+                    self.statusLabel?.stringValue = "Python not found. Run: brew install python && pip3 install openai-whisper"
                     self.statusLabel?.textColor = .systemRed
                     self.setupProgressBar?.isHidden = true
                     self.actionButton?.isEnabled = true
                     self.actionButton?.title = "Skip & Finish"
-                    Settings.shared.hasCompletedSetup = true
                 }
             }
         }
@@ -2108,7 +2141,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Create menu
         let menu = NSMenu()
-        menu.addItem(NSMenuItem(title: "Whisper Dictate v3.5.1", action: nil, keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Whisper Dictate v3.5.2", action: nil, keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "Status: Idle", action: nil, keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: Settings.shared.hotkeyDescription, action: nil, keyEquivalent: ""))
