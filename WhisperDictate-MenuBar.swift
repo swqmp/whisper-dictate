@@ -6,8 +6,49 @@ import CoreAudio
 import Security
 
 // MARK: - Configuration
-let whisperPath = "/opt/homebrew/bin/whisper"
 let tmpDir = "/tmp"
+
+func findExecutable(_ name: String) -> String? {
+    let searchPaths = [
+        "/opt/homebrew/bin",
+        "/usr/local/bin",
+        "/usr/bin",
+        NSHomeDirectory() + "/.local/bin",
+        NSHomeDirectory() + "/Library/Python/3.14/bin",
+        NSHomeDirectory() + "/Library/Python/3.13/bin",
+        NSHomeDirectory() + "/Library/Python/3.12/bin",
+        NSHomeDirectory() + "/Library/Python/3.11/bin"
+    ]
+    for dir in searchPaths {
+        let path = dir + "/" + name
+        if FileManager.default.isExecutableFile(atPath: path) {
+            return path
+        }
+    }
+    // Try `which` as fallback
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/which")
+    process.arguments = [name]
+    let pipe = Pipe()
+    process.standardOutput = pipe
+    process.standardError = Pipe()
+    do {
+        try process.run()
+        process.waitUntilExit()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        if let result = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines), !result.isEmpty {
+            return result
+        }
+    } catch {}
+    return nil
+}
+
+let whisperPath = findExecutable("whisper") ?? "/opt/homebrew/bin/whisper"
+let pythonPath = findExecutable("python3") ?? "/opt/homebrew/bin/python3"
+let systemPATH = [
+    "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin",
+    NSHomeDirectory() + "/.local/bin"
+].joined(separator: ":")
 
 let availableModels = ["tiny.en", "base.en", "small.en", "medium.en", "turbo"]
 let defaultModel = "base.en"
@@ -588,21 +629,24 @@ class PreferencesWindowController: NSObject, NSWindowDelegate {
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/opt/homebrew/bin/python3")
+            process.executableURL = URL(fileURLWithPath: pythonPath)
             process.arguments = ["-u", "-c", "import whisper; whisper.load_model('\(model)')"]
             process.environment = [
-                "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+                "PATH": systemPATH,
                 "HOME": NSHomeDirectory()
             ]
             self?.downloadProcess = process
 
             let stderrPipe = Pipe()
             process.standardError = stderrPipe
-            process.standardOutput = Pipe()
+            let stdoutPipe = Pipe()
+            process.standardOutput = stdoutPipe
 
+            var stderrOutput = ""
             stderrPipe.fileHandleForReading.readabilityHandler = { handle in
                 let data = handle.availableData
                 guard !data.isEmpty, let line = String(data: data, encoding: .utf8) else { return }
+                stderrOutput += line
                 if let range = line.range(of: #"(\d+)%\|"#, options: .regularExpression) {
                     let match = line[range]
                     let digits = match.filter { $0.isNumber }
@@ -620,17 +664,25 @@ class PreferencesWindowController: NSObject, NSWindowDelegate {
                 process.waitUntilExit()
                 stderrPipe.fileHandleForReading.readabilityHandler = nil
 
+                let exitCode = process.terminationStatus
                 DispatchQueue.main.async {
                     self?.downloadProcess = nil
                     self?.downloadProgress?.isHidden = true
-                    self?.refreshModelPopup()
-                    self?.updateModelStatus()
+                    if exitCode == 0 {
+                        self?.refreshModelPopup()
+                        self?.updateModelStatus()
+                    } else {
+                        let errMsg = stderrOutput.suffix(200).trimmingCharacters(in: .whitespacesAndNewlines)
+                        self?.modelStatusLabel?.stringValue = "Download failed: \(errMsg.isEmpty ? "exit code \(exitCode)" : String(errMsg.prefix(80)))"
+                        self?.modelStatusLabel?.textColor = NSColor.systemRed
+                        self?.downloadButton?.isHidden = false
+                    }
                 }
             } catch {
                 DispatchQueue.main.async {
                     self?.downloadProcess = nil
                     self?.downloadProgress?.isHidden = true
-                    self?.modelStatusLabel?.stringValue = "Download failed"
+                    self?.modelStatusLabel?.stringValue = "Python not found. Install: brew install python && pip3 install openai-whisper"
                     self?.modelStatusLabel?.textColor = NSColor.systemRed
                     self?.downloadButton?.isHidden = false
                 }
@@ -1471,21 +1523,24 @@ class PermissionSetupController: NSObject, NSWindowDelegate {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
             let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/opt/homebrew/bin/python3")
+            process.executableURL = URL(fileURLWithPath: pythonPath)
             process.arguments = ["-u", "-c", "import whisper; whisper.load_model('\(self.chosenModel)')"]
             process.environment = [
-                "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+                "PATH": systemPATH,
                 "HOME": NSHomeDirectory()
             ]
             self.downloadProcess = process
 
             let stderrPipe = Pipe()
             process.standardError = stderrPipe
-            process.standardOutput = Pipe()
+            let stdoutPipe = Pipe()
+            process.standardOutput = stdoutPipe
 
+            var stderrOutput = ""
             stderrPipe.fileHandleForReading.readabilityHandler = { handle in
                 let data = handle.availableData
                 guard !data.isEmpty, let line = String(data: data, encoding: .utf8) else { return }
+                stderrOutput += line
                 if let range = line.range(of: #"(\d+)%\|"#, options: .regularExpression) {
                     let match = line[range]
                     let digits = match.filter { $0.isNumber }
@@ -1503,21 +1558,33 @@ class PermissionSetupController: NSObject, NSWindowDelegate {
                 process.waitUntilExit()
                 stderrPipe.fileHandleForReading.readabilityHandler = nil
 
+                let exitCode = process.terminationStatus
                 DispatchQueue.main.async {
                     self.downloadProcess = nil
-                    Settings.shared.hasCompletedSetup = true
-                    self.statusLabel?.stringValue = "Download complete!"
-                    self.statusLabel?.textColor = .systemGreen
-                    self.setupProgressBar?.isHidden = true
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
-                        self.finishSetup()
+                    if exitCode == 0 {
+                        Settings.shared.hasCompletedSetup = true
+                        self.statusLabel?.stringValue = "Download complete!"
+                        self.statusLabel?.textColor = .systemGreen
+                        self.setupProgressBar?.isHidden = true
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+                            self.finishSetup()
+                        }
+                    } else {
+                        let errMsg = stderrOutput.suffix(200).trimmingCharacters(in: .whitespacesAndNewlines)
+                        self.statusLabel?.stringValue = "Download failed: \(errMsg.isEmpty ? "exit code \(exitCode)" : String(errMsg.prefix(80)))"
+                        self.statusLabel?.textColor = .systemRed
+                        self.setupProgressBar?.isHidden = true
+                        self.actionButton?.isEnabled = true
+                        self.actionButton?.title = "Skip & Finish"
+                        Settings.shared.hasCompletedSetup = true
                     }
                 }
             } catch {
                 DispatchQueue.main.async {
                     self.downloadProcess = nil
-                    self.statusLabel?.stringValue = "Download failed. You can download later from Settings."
+                    self.statusLabel?.stringValue = "Python not found. Install: brew install python && pip3 install openai-whisper"
                     self.statusLabel?.textColor = .systemRed
+                    self.setupProgressBar?.isHidden = true
                     self.actionButton?.isEnabled = true
                     self.actionButton?.title = "Skip & Finish"
                     Settings.shared.hasCompletedSetup = true
@@ -2041,7 +2108,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Create menu
         let menu = NSMenu()
-        menu.addItem(NSMenuItem(title: "Whisper Dictate v3.5", action: nil, keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Whisper Dictate v3.5.1", action: nil, keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "Status: Idle", action: nil, keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: Settings.shared.hotkeyDescription, action: nil, keyEquivalent: ""))
@@ -2252,7 +2319,7 @@ func smartFormat(_ text: String) -> String {
 func transcribe(audioFile: URL, processStarted: ((Process) -> Void)? = nil, onProgress: ((Int) -> Void)? = nil, completion: @escaping (String?) -> Void) {
     let process = Process()
     process.executableURL = URL(fileURLWithPath: whisperPath)
-    process.environment = ["PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    process.environment = ["PATH": systemPATH,
                            "HOME": NSHomeDirectory()]
     process.arguments = [
         audioFile.path,
