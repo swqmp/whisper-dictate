@@ -50,6 +50,75 @@ let systemPATH = [
     NSHomeDirectory() + "/.local/bin"
 ].joined(separator: ":")
 
+// Check if whisper Python package is importable
+func isWhisperInstalled() -> Bool {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: pythonPath)
+    process.arguments = ["-c", "import whisper"]
+    process.environment = ["PATH": systemPATH, "HOME": NSHomeDirectory()]
+    process.standardOutput = Pipe()
+    process.standardError = Pipe()
+    do {
+        try process.run()
+        process.waitUntilExit()
+        return process.terminationStatus == 0
+    } catch {
+        return false
+    }
+}
+
+// Install openai-whisper via pip3, calling onStatus with progress updates
+func installWhisperPackage(onStatus: @escaping (String) -> Void, completion: @escaping (Bool, String) -> Void) {
+    let pip = findExecutable("pip3") ?? pythonPath
+    let args: [String]
+    if pip == pythonPath {
+        args = ["-m", "pip", "install", "openai-whisper"]
+    } else {
+        args = ["install", "openai-whisper"]
+    }
+
+    DispatchQueue.global(qos: .userInitiated).async {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: pip)
+        process.arguments = args
+        process.environment = ["PATH": systemPATH, "HOME": NSHomeDirectory()]
+
+        let stderrPipe = Pipe()
+        let stdoutPipe = Pipe()
+        process.standardError = stderrPipe
+        process.standardOutput = stdoutPipe
+
+        var output = ""
+        stdoutPipe.fileHandleForReading.readabilityHandler = { handle in
+            let data = handle.availableData
+            guard !data.isEmpty, let line = String(data: data, encoding: .utf8) else { return }
+            output += line
+            if line.contains("Collecting") || line.contains("Installing") || line.contains("Downloading") {
+                let status = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                DispatchQueue.main.async { onStatus(String(status.prefix(60))) }
+            }
+        }
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+            stdoutPipe.fileHandleForReading.readabilityHandler = nil
+
+            let errData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+            let errStr = String(data: errData, encoding: .utf8) ?? ""
+
+            if process.terminationStatus == 0 {
+                completion(true, "")
+            } else {
+                let lines = (output + errStr).components(separatedBy: .newlines).filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+                completion(false, lines.last ?? "pip install failed")
+            }
+        } catch {
+            completion(false, "pip3 not found")
+        }
+    }
+}
+
 let availableModels = ["tiny.en", "base.en", "small.en", "medium.en", "turbo"]
 let defaultModel = "base.en"
 let whisperCacheDir = NSHomeDirectory() + "/.cache/whisper"
@@ -624,9 +693,39 @@ class PreferencesWindowController: NSObject, NSWindowDelegate {
         downloadButton?.isHidden = true
         downloadProgress?.isHidden = false
         downloadProgress?.doubleValue = 0
+
+        if !isWhisperInstalled() {
+            modelStatusLabel?.stringValue = "Installing whisper package..."
+            modelStatusLabel?.textColor = NSColor.systemOrange
+            downloadProgress?.isIndeterminate = true
+            downloadProgress?.startAnimation(nil)
+
+            installWhisperPackage(onStatus: { [weak self] status in
+                self?.modelStatusLabel?.stringValue = status
+            }, completion: { [weak self] success, errMsg in
+                DispatchQueue.main.async {
+                    self?.downloadProgress?.isIndeterminate = false
+                    self?.downloadProgress?.stopAnimation(nil)
+                    if success {
+                        self?.modelStatusLabel?.stringValue = "Downloading \(model)..."
+                        self?.runModelDownload(model)
+                    } else {
+                        self?.downloadProgress?.isHidden = true
+                        self?.modelStatusLabel?.stringValue = "Install failed: \(String(errMsg.prefix(80)))"
+                        self?.modelStatusLabel?.textColor = NSColor.systemRed
+                        self?.downloadButton?.isHidden = false
+                    }
+                }
+            })
+            return
+        }
+
         modelStatusLabel?.stringValue = "Downloading \(model)..."
         modelStatusLabel?.textColor = NSColor.systemOrange
+        runModelDownload(model)
+    }
 
+    private func runModelDownload(_ model: String) {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let process = Process()
             process.executableURL = URL(fileURLWithPath: pythonPath)
@@ -1294,106 +1393,72 @@ class PermissionSetupController: NSObject, NSWindowDelegate {
     }
 
     private func showLocalModelSetup() {
-        resizeWindow(height: 480)
+        resizeWindow(height: 420)
         stepIndicator?.stringValue = "Step 6 of 6 — Model Selection"
         titleLabel?.stringValue = "Choose a Whisper Model"
-        positionDesc(height: 480, descHeight: 30)
+        positionDesc(height: 420, descHeight: 30)
 
-        let ramBytes = ProcessInfo.processInfo.physicalMemory
-        let ramGB = Int(ramBytes / (1024 * 1024 * 1024))
-        descLabel?.stringValue = "Your Mac has \(ramGB) GB of RAM. Pick a model based on your needs:"
+        descLabel?.stringValue = "Pick a model based on your Mac's RAM:"
         actionButton?.title = "Download & Finish"
         statusLabel?.stringValue = ""
 
         guard let cv = window?.contentView else { return }
 
-        // Determine recommended model
-        let recommended: String
-        if ramGB >= 32 {
-            recommended = "turbo"
-        } else if ramGB >= 16 {
-            recommended = "small.en"
-        } else {
-            recommended = "base.en"
-        }
-        chosenModel = recommended
+        chosenModel = "base.en"
 
         struct ModelInfo {
             let name: String
             let size: String
             let speed: String
             let accuracy: String
+            let ramNote: String
         }
 
         let models: [ModelInfo] = [
-            ModelInfo(name: "tiny.en", size: "75 MB", speed: "Fastest", accuracy: "Basic"),
-            ModelInfo(name: "base.en", size: "140 MB", speed: "Fast", accuracy: "Good"),
-            ModelInfo(name: "small.en", size: "465 MB", speed: "Moderate", accuracy: "Great"),
-            ModelInfo(name: "medium.en", size: "1.5 GB", speed: "Slower", accuracy: "Excellent"),
-            ModelInfo(name: "turbo", size: "1.5 GB", speed: "Fast", accuracy: "Excellent"),
+            ModelInfo(name: "tiny.en", size: "75 MB", speed: "Fastest", accuracy: "Basic", ramNote: "Any Mac"),
+            ModelInfo(name: "base.en", size: "140 MB", speed: "Fast", accuracy: "Good", ramNote: "8 GB+"),
+            ModelInfo(name: "small.en", size: "465 MB", speed: "Moderate", accuracy: "Great", ramNote: "16 GB+"),
+            ModelInfo(name: "medium.en", size: "1.5 GB", speed: "Slower", accuracy: "Excellent", ramNote: "16 GB+"),
+            ModelInfo(name: "turbo", size: "1.5 GB", speed: "Fast", accuracy: "Excellent", ramNote: "32 GB+"),
         ]
 
-        var y = 350
+        var y = 300
         for (i, model) in models.enumerated() {
-            let isRec = model.name == recommended
+            let isDefault = model.name == "base.en"
             let installed = FileManager.default.fileExists(atPath: whisperCacheDir + "/\(model.name).pt")
 
             let radio = NSButton(radioButtonWithTitle: "", target: self, action: #selector(modelRadioChanged(_:)))
             radio.frame = NSRect(x: 20, y: y, width: 20, height: 20)
             radio.tag = i
-            radio.state = isRec ? .on : .off
+            radio.state = isDefault ? .on : .off
             cv.addSubview(radio)
             dynamicViews.append(radio)
 
             let nameLabel = NSTextField(labelWithString: model.name)
-            nameLabel.font = NSFont.monospacedSystemFont(ofSize: 13, weight: isRec ? .bold : .regular)
+            nameLabel.font = NSFont.monospacedSystemFont(ofSize: 13, weight: isDefault ? .bold : .regular)
             nameLabel.frame = NSRect(x: 42, y: y, width: 80, height: 18)
             cv.addSubview(nameLabel)
             dynamicViews.append(nameLabel)
 
-            let detailText = "\(model.size)  •  \(model.speed)  •  \(model.accuracy)"
+            let detailText = "\(model.size)  •  \(model.speed)  •  \(model.accuracy)  •  \(model.ramNote)"
             let detailLabel = NSTextField(labelWithString: detailText)
             detailLabel.font = NSFont.systemFont(ofSize: 11)
             detailLabel.textColor = .secondaryLabelColor
-            detailLabel.frame = NSRect(x: 130, y: y, width: 200, height: 18)
+            detailLabel.frame = NSRect(x: 130, y: y, width: 250, height: 18)
             cv.addSubview(detailLabel)
             dynamicViews.append(detailLabel)
 
-            // Badge: Recommended or Installed
-            if isRec {
-                let badge = NSTextField(labelWithString: "Recommended")
-                badge.font = NSFont.systemFont(ofSize: 10, weight: .semibold)
-                badge.textColor = .systemBlue
-                badge.frame = NSRect(x: 340, y: y, width: 90, height: 18)
-                cv.addSubview(badge)
-                dynamicViews.append(badge)
-            } else if installed {
+            if installed {
                 let badge = NSTextField(labelWithString: "Installed")
                 badge.font = NSFont.systemFont(ofSize: 10, weight: .medium)
                 badge.textColor = .systemGreen
-                badge.frame = NSRect(x: 340, y: y, width: 90, height: 18)
+                badge.frame = NSRect(x: 385, y: y, width: 50, height: 18)
                 cv.addSubview(badge)
                 dynamicViews.append(badge)
             }
 
             y -= 30
         }
-
-        // RAM recommendation note
-        let recNote: String
-        if ramGB >= 32 {
-            recNote = "With \(ramGB) GB RAM, you can comfortably run any model. Turbo gives the best accuracy with good speed."
-        } else if ramGB >= 16 {
-            recNote = "With \(ramGB) GB RAM, small.en is the best balance of speed and accuracy. Medium and turbo will work but use more memory."
-        } else {
-            recNote = "With \(ramGB) GB RAM, base.en is recommended. Larger models may slow down your Mac."
-        }
-        let note = NSTextField(wrappingLabelWithString: recNote)
-        note.font = NSFont.systemFont(ofSize: 11)
-        note.textColor = .secondaryLabelColor
-        note.frame = NSRect(x: 20, y: y - 15, width: 400, height: 35)
-        cv.addSubview(note)
-        dynamicViews.append(note)
 
         // Progress bar (hidden until download starts)
         let progress = NSProgressIndicator(frame: NSRect(x: 20, y: 70, width: 400, height: 6))
@@ -1538,13 +1603,48 @@ class PermissionSetupController: NSObject, NSWindowDelegate {
             return
         }
 
-        // Download the model
         actionButton?.isEnabled = false
-        actionButton?.title = "Downloading..."
+        actionButton?.title = "Setting up..."
         setupProgressBar?.isHidden = false
         setupProgressBar?.doubleValue = 0
+
+        // Check if whisper is installed first
+        if !isWhisperInstalled() {
+            statusLabel?.stringValue = "Installing whisper package..."
+            statusLabel?.textColor = .systemOrange
+            setupProgressBar?.isIndeterminate = true
+            setupProgressBar?.startAnimation(nil)
+
+            installWhisperPackage(onStatus: { [weak self] status in
+                self?.statusLabel?.stringValue = status
+            }, completion: { [weak self] success, errMsg in
+                DispatchQueue.main.async {
+                    guard let self = self else { return }
+                    self.setupProgressBar?.isIndeterminate = false
+                    self.setupProgressBar?.stopAnimation(nil)
+                    if success {
+                        self.statusLabel?.stringValue = "Downloading \(self.chosenModel)..."
+                        self.runSetupModelDownload()
+                    } else {
+                        self.statusLabel?.stringValue = "Install failed: \(String(errMsg.prefix(80)))"
+                        self.statusLabel?.textColor = .systemRed
+                        self.setupProgressBar?.isHidden = true
+                        self.actionButton?.isEnabled = true
+                        self.actionButton?.title = "Skip & Finish"
+                    }
+                }
+            })
+            return
+        }
+
         statusLabel?.stringValue = "Downloading \(chosenModel)..."
         statusLabel?.textColor = .systemOrange
+        runSetupModelDownload()
+    }
+
+    private func runSetupModelDownload() {
+        actionButton?.title = "Downloading..."
+        setupProgressBar?.doubleValue = 0
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
@@ -1598,15 +1698,7 @@ class PermissionSetupController: NSObject, NSWindowDelegate {
                     } else {
                         let lines = stderrOutput.components(separatedBy: .newlines).filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
                         let lastLine = lines.last ?? "exit code \(exitCode)"
-                        let errSummary: String
-                        if lastLine.contains("No module named") {
-                            errSummary = "whisper not installed. Run: pip3 install openai-whisper"
-                        } else if lastLine.contains("ModuleNotFoundError") || lastLine.contains("ImportError") {
-                            errSummary = "Missing dependency. Run: pip3 install openai-whisper"
-                        } else {
-                            errSummary = String(lastLine.prefix(100))
-                        }
-                        self.statusLabel?.stringValue = "Failed: \(errSummary)"
+                        self.statusLabel?.stringValue = "Failed: \(String(lastLine.prefix(100)))"
                         self.statusLabel?.textColor = .systemRed
                         self.setupProgressBar?.isHidden = true
                         self.actionButton?.isEnabled = true
@@ -1616,7 +1708,7 @@ class PermissionSetupController: NSObject, NSWindowDelegate {
             } catch {
                 DispatchQueue.main.async {
                     self.downloadProcess = nil
-                    self.statusLabel?.stringValue = "Python not found. Run: brew install python && pip3 install openai-whisper"
+                    self.statusLabel?.stringValue = "Python not found. Run: brew install python"
                     self.statusLabel?.textColor = .systemRed
                     self.setupProgressBar?.isHidden = true
                     self.actionButton?.isEnabled = true
@@ -2141,7 +2233,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Create menu
         let menu = NSMenu()
-        menu.addItem(NSMenuItem(title: "Whisper Dictate v3.5.2", action: nil, keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Whisper Dictate v3.5.3", action: nil, keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "Status: Idle", action: nil, keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: Settings.shared.hotkeyDescription, action: nil, keyEquivalent: ""))
