@@ -152,7 +152,8 @@ enum RecordingMode: Int {
 
 enum TranscriptionBackend: Int {
     case local = 0
-    case cloud = 1
+    case cloud = 1       // OpenAI Whisper
+    case cloud_xai = 2  // xAI Grok STT
 }
 
 class Settings {
@@ -217,6 +218,17 @@ class Settings {
                 KeychainHelper.save(key: "openai-api-key", value: val)
             } else {
                 KeychainHelper.delete(key: "openai-api-key")
+            }
+        }
+    }
+
+    var xaiApiKey: String? {
+        get { KeychainHelper.read(key: "xai-api-key") }
+        set {
+            if let val = newValue, !val.isEmpty {
+                KeychainHelper.save(key: "xai-api-key", value: val)
+            } else {
+                KeychainHelper.delete(key: "xai-api-key")
             }
         }
     }
@@ -347,6 +359,7 @@ class PreferencesWindowController: NSObject, NSWindowDelegate {
     private var localViews: [NSView] = []
     private var cloudViews: [NSView] = []
     private var apiKeyField: NSSecureTextField?
+    private var cloudHintLabel: NSTextField?
     private var modelPopupRef: NSPopUpButton?
     private var modelStatusLabel: NSTextField?
     private var downloadButton: NSButton?
@@ -469,7 +482,7 @@ class PreferencesWindowController: NSObject, NSWindowDelegate {
         contentView.addSubview(backendLabel)
 
         let backendPopup = NSPopUpButton(frame: NSRect(x: 170, y: y - 5, width: 190, height: 30), pullsDown: false)
-        backendPopup.addItems(withTitles: ["Local (on-device)", "Cloud (OpenAI API)"])
+        backendPopup.addItems(withTitles: ["Local (on-device)", "Cloud (OpenAI Whisper)", "Cloud (xAI Grok)"])
         backendPopup.selectItem(at: Settings.shared.transcriptionBackend.rawValue)
         backendPopup.target = self
         backendPopup.action = #selector(backendChanged(_:))
@@ -546,28 +559,36 @@ class PreferencesWindowController: NSObject, NSWindowDelegate {
         cloudViews.append(keyLabel)
 
         let keyField = NSSecureTextField(frame: NSRect(x: 170, y: y - 2, width: 190, height: 24))
-        keyField.placeholderString = "sk-..."
-        keyField.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
-        if let existing = Settings.shared.openAIApiKey {
-            keyField.stringValue = existing
+        let initialBackend = Settings.shared.transcriptionBackend
+        if initialBackend == .cloud_xai {
+            keyField.placeholderString = "xai-..."
+            keyField.stringValue = Settings.shared.xaiApiKey ?? ""
+        } else {
+            keyField.placeholderString = "sk-..."
+            keyField.stringValue = Settings.shared.openAIApiKey ?? ""
         }
+        keyField.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
         keyField.target = self
         keyField.action = #selector(apiKeyChanged(_:))
         contentView.addSubview(keyField)
         cloudViews.append(keyField)
         self.apiKeyField = keyField
 
-        let cloudHint = NSTextField(labelWithString: "Model: whisper-1  |  ~$0.006/min\nKey stored in Keychain, not plain text.")
+        let initialHintText = initialBackend == .cloud_xai
+            ? "Model: grok-stt  |  $0.10/hour batch\nKey stored in Keychain, not plain text."
+            : "Model: whisper-1  |  ~$0.006/min\nKey stored in Keychain, not plain text."
+        let cloudHint = NSTextField(labelWithString: initialHintText)
         cloudHint.frame = NSRect(x: 20, y: y - 40, width: 340, height: 30)
         cloudHint.font = NSFont.systemFont(ofSize: 11)
         cloudHint.textColor = .secondaryLabelColor
         contentView.addSubview(cloudHint)
         cloudViews.append(cloudHint)
+        self.cloudHintLabel = cloudHint
 
-        // Show/hide based on current backend
-        let isCloud = Settings.shared.transcriptionBackend == .cloud
-        localViews.forEach { $0.isHidden = isCloud }
-        cloudViews.forEach { $0.isHidden = !isCloud }
+        // Show/hide based on current backend (local vs any cloud)
+        let isLocal = Settings.shared.transcriptionBackend == .local
+        localViews.forEach { $0.isHidden = !isLocal }
+        cloudViews.forEach { $0.isHidden = isLocal }
 
         // Set model status after show/hide so it doesn't get overridden
         updateModelStatus()
@@ -631,14 +652,29 @@ class PreferencesWindowController: NSObject, NSWindowDelegate {
     @objc func backendChanged(_ sender: NSPopUpButton) {
         let backend = TranscriptionBackend(rawValue: sender.indexOfSelectedItem) ?? .local
         Settings.shared.transcriptionBackend = backend
-        let isCloud = backend == .cloud
-        localViews.forEach { $0.isHidden = isCloud }
-        cloudViews.forEach { $0.isHidden = !isCloud }
+        let isLocal = backend == .local
+        localViews.forEach { $0.isHidden = !isLocal }
+        cloudViews.forEach { $0.isHidden = isLocal }
+        // Repopulate key field + hint for whichever cloud backend is now active
+        if backend == .cloud_xai {
+            apiKeyField?.placeholderString = "xai-..."
+            apiKeyField?.stringValue = Settings.shared.xaiApiKey ?? ""
+            cloudHintLabel?.stringValue = "Model: grok-stt  |  $0.10/hour batch\nKey stored in Keychain, not plain text."
+        } else if backend == .cloud {
+            apiKeyField?.placeholderString = "sk-..."
+            apiKeyField?.stringValue = Settings.shared.openAIApiKey ?? ""
+            cloudHintLabel?.stringValue = "Model: whisper-1  |  ~$0.006/min\nKey stored in Keychain, not plain text."
+        }
     }
 
     @objc func apiKeyChanged(_ sender: NSSecureTextField) {
         let key = sender.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        Settings.shared.openAIApiKey = key.isEmpty ? nil : key
+        let value: String? = key.isEmpty ? nil : key
+        if Settings.shared.transcriptionBackend == .cloud_xai {
+            Settings.shared.xaiApiKey = value
+        } else {
+            Settings.shared.openAIApiKey = value
+        }
     }
 
     func isModelDownloaded(_ model: String) -> Bool {
@@ -1294,10 +1330,10 @@ class PermissionSetupController: NSObject, NSWindowDelegate {
 
     // MARK: Step 4 — Backend Choice
     private func showBackendChoice() {
-        resizeWindow(height: 360)
+        resizeWindow(height: 420)
         stepIndicator?.stringValue = "Step 5 of 6"
         titleLabel?.stringValue = "Choose Your Transcription Method"
-        positionDesc(height: 360, descHeight: 30)
+        positionDesc(height: 420, descHeight: 30)
         descLabel?.stringValue = "You can change this anytime in Settings."
         actionButton?.title = "Continue"
         statusLabel?.stringValue = ""
@@ -1306,7 +1342,7 @@ class PermissionSetupController: NSObject, NSWindowDelegate {
 
         // Local option
         let localRadio = NSButton(radioButtonWithTitle: "  Local (On-Device)", target: self, action: #selector(backendRadioChanged(_:)))
-        localRadio.frame = NSRect(x: 20, y: 210, width: 400, height: 20)
+        localRadio.frame = NSRect(x: 20, y: 270, width: 400, height: 20)
         localRadio.font = NSFont.systemFont(ofSize: 14, weight: .medium)
         localRadio.tag = 0
         localRadio.state = .on
@@ -1316,13 +1352,13 @@ class PermissionSetupController: NSObject, NSWindowDelegate {
         let localDesc = NSTextField(labelWithString: "Completely private. Free, runs entirely on your Mac. No internet needed.")
         localDesc.font = NSFont.systemFont(ofSize: 11)
         localDesc.textColor = .secondaryLabelColor
-        localDesc.frame = NSRect(x: 42, y: 190, width: 380, height: 16)
+        localDesc.frame = NSRect(x: 42, y: 250, width: 380, height: 16)
         cv.addSubview(localDesc)
         dynamicViews.append(localDesc)
 
-        // Cloud option
-        let cloudRadio = NSButton(radioButtonWithTitle: "  Cloud (OpenAI API)", target: self, action: #selector(backendRadioChanged(_:)))
-        cloudRadio.frame = NSRect(x: 20, y: 150, width: 400, height: 20)
+        // Cloud (OpenAI Whisper)
+        let cloudRadio = NSButton(radioButtonWithTitle: "  Cloud (OpenAI Whisper)", target: self, action: #selector(backendRadioChanged(_:)))
+        cloudRadio.frame = NSRect(x: 20, y: 210, width: 400, height: 20)
         cloudRadio.font = NSFont.systemFont(ofSize: 14, weight: .medium)
         cloudRadio.tag = 1
         cloudRadio.state = .off
@@ -1332,39 +1368,61 @@ class PermissionSetupController: NSObject, NSWindowDelegate {
         let cloudDesc = NSTextField(labelWithString: "Uses OpenAI's whisper-1 model. Fast, no RAM usage. ~$0.006/min.")
         cloudDesc.font = NSFont.systemFont(ofSize: 11)
         cloudDesc.textColor = .secondaryLabelColor
-        cloudDesc.frame = NSRect(x: 42, y: 130, width: 380, height: 16)
+        cloudDesc.frame = NSRect(x: 42, y: 190, width: 380, height: 16)
         cv.addSubview(cloudDesc)
         dynamicViews.append(cloudDesc)
+
+        // Cloud (xAI Grok)
+        let xaiRadio = NSButton(radioButtonWithTitle: "  Cloud (xAI Grok)", target: self, action: #selector(backendRadioChanged(_:)))
+        xaiRadio.frame = NSRect(x: 20, y: 150, width: 400, height: 20)
+        xaiRadio.font = NSFont.systemFont(ofSize: 14, weight: .medium)
+        xaiRadio.tag = 2
+        xaiRadio.state = .off
+        cv.addSubview(xaiRadio)
+        dynamicViews.append(xaiRadio)
+
+        let xaiDesc = NSTextField(labelWithString: "Uses xAI's grok-stt model. Cheaper than OpenAI ($0.10/hour batch). Word-level timestamps.")
+        xaiDesc.font = NSFont.systemFont(ofSize: 11)
+        xaiDesc.textColor = .secondaryLabelColor
+        xaiDesc.frame = NSRect(x: 42, y: 130, width: 380, height: 16)
+        cv.addSubview(xaiDesc)
+        dynamicViews.append(xaiDesc)
 
         chosenBackend = .local
     }
 
     @objc func backendRadioChanged(_ sender: NSButton) {
-        chosenBackend = sender.tag == 1 ? .cloud : .local
+        chosenBackend = TranscriptionBackend(rawValue: sender.tag) ?? .local
     }
 
     // MARK: Step 4 — Backend-Specific Setup
     private func showBackendSetup() {
-        if chosenBackend == .cloud {
-            showCloudSetup()
-        } else {
+        if chosenBackend == .local {
             showLocalModelSetup()
+        } else {
+            showCloudSetup()
         }
     }
 
     private func showCloudSetup() {
+        let isXai = chosenBackend == .cloud_xai
         resizeWindow(height: 380)
         stepIndicator?.stringValue = "Step 6 of 6 — API Setup"
-        titleLabel?.stringValue = "Set Up OpenAI API"
+        titleLabel?.stringValue = isXai ? "Set Up xAI Grok API" : "Set Up OpenAI API"
         positionDesc(height: 380, descHeight: 40)
-        descLabel?.stringValue = "You need an OpenAI API key to use cloud transcription. It takes about 30 seconds to set up."
+        descLabel?.stringValue = isXai
+            ? "You need an xAI API key to use Grok cloud transcription. It takes about 30 seconds to set up."
+            : "You need an OpenAI API key to use cloud transcription. It takes about 30 seconds to set up."
         actionButton?.title = "Finish Setup"
         statusLabel?.stringValue = ""
 
         guard let cv = window?.contentView else { return }
 
         // Steps
-        let steps = NSTextField(wrappingLabelWithString: "1. Go to platform.openai.com/api-keys\n2. Sign in or create an account\n3. Click \"Create new secret key\"\n4. Copy the key and paste it below")
+        let stepsText = isXai
+            ? "1. Go to console.x.ai\n2. Sign in or create an account\n3. Click \"Create API Key\"\n4. Copy the key and paste it below"
+            : "1. Go to platform.openai.com/api-keys\n2. Sign in or create an account\n3. Click \"Create new secret key\"\n4. Copy the key and paste it below"
+        let steps = NSTextField(wrappingLabelWithString: stepsText)
         steps.font = NSFont.systemFont(ofSize: 12)
         steps.frame = NSRect(x: 20, y: 145, width: 400, height: 80)
         cv.addSubview(steps)
@@ -1378,7 +1436,7 @@ class PermissionSetupController: NSObject, NSWindowDelegate {
         dynamicViews.append(keyLabel)
 
         let keyField = NSSecureTextField(frame: NSRect(x: 95, y: 112, width: 325, height: 26))
-        keyField.placeholderString = "sk-..."
+        keyField.placeholderString = isXai ? "xai-..." : "sk-..."
         keyField.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
         cv.addSubview(keyField)
         dynamicViews.append(keyField)
@@ -1491,10 +1549,10 @@ class PermissionSetupController: NSObject, NSWindowDelegate {
             currentStep = 5
             showCurrentStep()
         case 5: // Final setup
-            if chosenBackend == .cloud {
-                finishCloudSetup()
-            } else {
+            if chosenBackend == .local {
                 finishLocalSetup()
+            } else {
+                finishCloudSetup()
             }
         default: finishSetup()
         }
@@ -1585,8 +1643,12 @@ class PermissionSetupController: NSObject, NSWindowDelegate {
             statusLabel?.textColor = .systemRed
             return
         }
-        Settings.shared.transcriptionBackend = .cloud
-        Settings.shared.openAIApiKey = key
+        Settings.shared.transcriptionBackend = chosenBackend
+        if chosenBackend == .cloud_xai {
+            Settings.shared.xaiApiKey = key
+        } else {
+            Settings.shared.openAIApiKey = key
+        }
         Settings.shared.hasCompletedSetup = true
         finishSetup()
     }
@@ -2233,7 +2295,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Create menu
         let menu = NSMenu()
-        menu.addItem(NSMenuItem(title: "Whisper Dictate v3.5.3", action: nil, keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Whisper Dictate v3.6.0", action: nil, keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "Status: Idle", action: nil, keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: Settings.shared.hotkeyDescription, action: nil, keyEquivalent: ""))
@@ -2509,15 +2571,35 @@ func transcribe(audioFile: URL, processStarted: ((Process) -> Void)? = nil, onPr
     }
 }
 
-// MARK: - Cloud Transcription (OpenAI API)
+// MARK: - Cloud Transcription (router)
+// Routes to OpenAI Whisper or xAI Grok STT based on Settings.transcriptionBackend.
 func transcribeCloud(audioFile: URL, completion: @escaping (String?) -> Void) {
+    if Settings.shared.transcriptionBackend == .cloud_xai {
+        transcribeCloudGrok(audioFile: audioFile, completion: completion)
+    } else {
+        transcribeCloudOpenAI(audioFile: audioFile, completion: completion)
+    }
+}
+
+// Shared response cleaner for both cloud backends.
+fileprivate func cleanCloudTranscript(_ text: String) -> String {
+    if Settings.shared.formattingMode == .formal {
+        return smartFormat(text)
+    }
+    var raw = text.replacingOccurrences(of: "\n", with: " ")
+    while raw.contains("  ") { raw = raw.replacingOccurrences(of: "  ", with: " ") }
+    return raw.trimmingCharacters(in: .whitespacesAndNewlines)
+}
+
+// MARK: - Cloud Transcription (OpenAI Whisper)
+func transcribeCloudOpenAI(audioFile: URL, completion: @escaping (String?) -> Void) {
     guard let apiKey = Settings.shared.openAIApiKey, !apiKey.isEmpty else {
         completion(nil)
         return
     }
 
     let url = URL(string: "https://api.openai.com/v1/audio/transcriptions")!
-    var request = URLRequest(url: url)
+    var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 45)
     request.httpMethod = "POST"
     request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
 
@@ -2525,17 +2607,14 @@ func transcribeCloud(audioFile: URL, completion: @escaping (String?) -> Void) {
     request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
 
     var body = Data()
-    // Model field
     body.append("--\(boundary)\r\n".data(using: .utf8)!)
     body.append("Content-Disposition: form-data; name=\"model\"\r\n\r\n".data(using: .utf8)!)
     body.append("whisper-1\r\n".data(using: .utf8)!)
 
-    // Language field
     body.append("--\(boundary)\r\n".data(using: .utf8)!)
     body.append("Content-Disposition: form-data; name=\"language\"\r\n\r\n".data(using: .utf8)!)
     body.append("en\r\n".data(using: .utf8)!)
 
-    // Audio file
     body.append("--\(boundary)\r\n".data(using: .utf8)!)
     body.append("Content-Disposition: form-data; name=\"file\"; filename=\"\(audioFile.lastPathComponent)\"\r\n".data(using: .utf8)!)
     body.append("Content-Type: audio/wav\r\n\r\n".data(using: .utf8)!)
@@ -2546,12 +2625,11 @@ func transcribeCloud(audioFile: URL, completion: @escaping (String?) -> Void) {
 
     request.httpBody = body
 
-    URLSession.shared.dataTask(with: request) { data, response, error in
-        // Cleanup audio file
+    URLSession(configuration: .ephemeral).dataTask(with: request) { data, response, error in
         try? FileManager.default.removeItem(at: audioFile)
 
         if let error = error {
-            print("Cloud transcription error: \(error)")
+            print("OpenAI Whisper transcription error: \(error)")
             completion(nil)
             return
         }
@@ -2561,21 +2639,73 @@ func transcribeCloud(audioFile: URL, completion: @escaping (String?) -> Void) {
             return
         }
 
-        // Parse JSON response: {"text": "..."}
         if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
            let text = json["text"] as? String {
-            let cleaned: String
-            if Settings.shared.formattingMode == .formal {
-                cleaned = smartFormat(text)
-            } else {
-                var raw = text.replacingOccurrences(of: "\n", with: " ")
-                while raw.contains("  ") { raw = raw.replacingOccurrences(of: "  ", with: " ") }
-                cleaned = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-            }
-            completion(cleaned)
+            completion(cleanCloudTranscript(text))
         } else {
             if let errorStr = String(data: data, encoding: .utf8) {
-                print("Cloud transcription API error: \(errorStr)")
+                print("OpenAI Whisper API error: \(errorStr)")
+            }
+            completion(nil)
+        }
+    }.resume()
+}
+
+// MARK: - Cloud Transcription (xAI Grok STT)
+// POST https://api.x.ai/v1/stt with multipart model=grok-stt + file. JSON response includes .text.
+func transcribeCloudGrok(audioFile: URL, completion: @escaping (String?) -> Void) {
+    guard let apiKey = Settings.shared.xaiApiKey, !apiKey.isEmpty else {
+        completion(nil)
+        return
+    }
+
+    let url = URL(string: "https://api.x.ai/v1/stt")!
+    var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 45)
+    request.httpMethod = "POST"
+    request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+
+    let boundary = UUID().uuidString
+    request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+
+    var body = Data()
+    body.append("--\(boundary)\r\n".data(using: .utf8)!)
+    body.append("Content-Disposition: form-data; name=\"model\"\r\n\r\n".data(using: .utf8)!)
+    body.append("grok-stt\r\n".data(using: .utf8)!)
+
+    body.append("--\(boundary)\r\n".data(using: .utf8)!)
+    body.append("Content-Disposition: form-data; name=\"language\"\r\n\r\n".data(using: .utf8)!)
+    body.append("en\r\n".data(using: .utf8)!)
+
+    body.append("--\(boundary)\r\n".data(using: .utf8)!)
+    body.append("Content-Disposition: form-data; name=\"file\"; filename=\"\(audioFile.lastPathComponent)\"\r\n".data(using: .utf8)!)
+    body.append("Content-Type: audio/wav\r\n\r\n".data(using: .utf8)!)
+    if let audioData = try? Data(contentsOf: audioFile) {
+        body.append(audioData)
+    }
+    body.append("\r\n--\(boundary)--\r\n".data(using: .utf8)!)
+
+    request.httpBody = body
+
+    URLSession(configuration: .ephemeral).dataTask(with: request) { data, response, error in
+        try? FileManager.default.removeItem(at: audioFile)
+
+        if let error = error {
+            print("xAI Grok STT transcription error: \(error)")
+            completion(nil)
+            return
+        }
+
+        guard let data = data else {
+            completion(nil)
+            return
+        }
+
+        if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let text = json["text"] as? String {
+            completion(cleanCloudTranscript(text))
+        } else {
+            if let errorStr = String(data: data, encoding: .utf8) {
+                print("xAI Grok STT API error: \(errorStr)")
             }
             completion(nil)
         }
@@ -2814,8 +2944,8 @@ class HotkeyMonitor {
             }
         }
 
-        if Settings.shared.transcriptionBackend == .cloud {
-            // Cloud: send to OpenAI API
+        if Settings.shared.transcriptionBackend != .local {
+            // Cloud: route to OpenAI Whisper or xAI Grok STT (router decides)
             transcribeCloud(audioFile: audioFile, completion: handleResult)
         } else {
             // Local: run whisper CLI with download progress

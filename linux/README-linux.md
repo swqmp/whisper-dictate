@@ -1,6 +1,10 @@
 # WhisperDictate for Linux
 
-Push-to-talk dictation for Wayland (Hyprland). Hold **Super + Ctrl + X** to record, release to transcribe and type. Uses OpenAI's Whisper for local transcription — no API key, no cloud, fully offline.
+Push-to-talk dictation for Wayland (Hyprland). Hold **Super + Ctrl + X** to record, release to transcribe and type.
+
+Two backends:
+- **`local`** — OpenAI's Whisper runs on your machine. No API key, no cloud, fully offline. Default.
+- **`cloud_xai`** — xAI Grok STT API (`grok-stt`). Faster + better entity recognition, ~$0.10/hour batch. Requires xAI API key.
 
 ## Requirements
 
@@ -94,7 +98,7 @@ Edit `~/.config/whisper-dictate/config.ini`:
 model = base
 ```
 
-### Model options
+### Model options (local backend only)
 
 | Model | Size | Speed | Accuracy |
 |-------|------|-------|----------|
@@ -102,6 +106,28 @@ model = base
 | `small` | ~465 MB | Slower | Better for complex speech |
 
 The model downloads automatically on first use and is cached at `~/.cache/whisper/`.
+
+### Switching to xAI Grok cloud backend
+
+1. Get an xAI API key at https://console.x.ai
+2. Save it (one of the two ways):
+   ```bash
+   # Option A: file (chmod 600)
+   mkdir -p ~/.config/whisper-dictate
+   echo 'xai-...' > ~/.config/whisper-dictate/xai-api-key
+   chmod 600 ~/.config/whisper-dictate/xai-api-key
+
+   # Option B: environment variable (export from your shell rc)
+   export XAI_API_KEY='xai-...'
+   ```
+3. Switch backend in config:
+   ```ini
+   [whisper]
+   backend = cloud_xai
+   ```
+4. Verify: `whisper-dictate check` — should show "Backend: cloud_xai" and a masked key.
+
+The cloud_xai backend uses `curl` to POST to `https://api.x.ai/v1/stt` with model `grok-stt`. No additional Python deps required.
 
 ## Usage
 

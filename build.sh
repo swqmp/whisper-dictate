@@ -46,9 +46,9 @@ cat > WhisperDictate.app/Contents/Info.plist << 'EOF'
     <key>CFBundleName</key>
     <string>WhisperDictate</string>
     <key>CFBundleShortVersionString</key>
-    <string>3.0</string>
+    <string>3.6.0</string>
     <key>CFBundleVersion</key>
-    <string>3</string>
+    <string>360</string>
     <key>LSMinimumSystemVersion</key>
     <string>12.0</string>
     <key>LSUIElement</key>
@@ -85,4 +85,4 @@ echo ""
 echo "First launch:"
 echo "  1. Grant Microphone permission when prompted"
 echo "  2. Grant Accessibility permission (System Settings > Privacy & Security > Accessibility)"
-echo "  3. Choose Local or Cloud transcription in the menu bar settings"
+echo "  3. Choose Local, Cloud (OpenAI Whisper), or Cloud (xAI Grok) in the menu bar settings"
